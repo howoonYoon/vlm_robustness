@@ -1,0 +1,5 @@
+dataset,filepath,fileindex,severity,binarylabel
+mri,mri/demos/normal_0001.png,normal_0001,clean,0
+mri,mri/demos/disease_0001.png,disease_0001,clean,1
+oct,oct/demos/normal_0001.png,normal_0001,clean,0
+oct,oct/demos/disease_0001.png,disease_0001,clean,1

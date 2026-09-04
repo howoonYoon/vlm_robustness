@@ -1,0 +1,5 @@
+dataset,filepath,fileindex,use_type,severity,binarylabel,corruption
+mri,mri/train/case_0001_clean.png,case_0001,train,clean,0,none
+mri,mri/train/case_0001_noise.png,case_0001,train,weak,0,gaussian_noise
+oct,oct/val/case_0002_clean.png,case_0002,val,clean,1,none
+oct,oct/val/case_0002_blur.png,case_0002,val,weak,1,blur

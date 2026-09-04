@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Only needed with --load_4bit.
+bitsandbytes==0.50.2

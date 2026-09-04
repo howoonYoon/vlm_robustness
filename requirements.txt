@@ -1,0 +1,17 @@
+# Reference environment for the reproducible scripts.
+# Install the PyTorch wheel appropriate for the host CUDA version first when needed.
+accelerate==1.14.0
+einops==0.8.2
+numpy==2.3.3
+opencv-python==4.13.0.92
+pandas==3.0.0
+Pillow==12.1.0
+safetensors==0.7.0
+scikit-image==0.26.0
+scikit-learn==1.8.0
+scipy==1.17.0
+sentencepiece==0.2.2
+torch==2.10.0
+torchio==0.21.3
+torchvision==0.25.0
+transformers==5.9.0
