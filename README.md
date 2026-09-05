@@ -10,7 +10,7 @@ Supported methods include:
 - Low-Rank Adaptation (LoRA)
 - Final-representation adapter tuning
 
-All commands below assume that they are executed from the repository root.
+All commands below assume that they are executed from the repository root. Run scripts as modules with `python -m` so that shared utilities can be imported. For example, use `python -m evaluation.vlm_few_shot --help`, `python -m training.proj_gen_train --help`, or `python -m training.lora_gen_train --help`.
 
 ## 1. Overview
 
@@ -29,13 +29,13 @@ Datasets are supplied through metadata CSV files, allowing the same scripts to b
 Python 3.11 or later is recommended.
 
 ```bash
-python -m pip install -r Codes/reproducible/requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 For experiments requiring 4-bit model loading:
 
 ```bash
-python -m pip install -r Codes/reproducible/requirements-4bit.txt
+python -m pip install -r requirements-4bit.txt
 ```
 
 For GPU execution, use a PyTorch build compatible with the CUDA version installed on your system.
@@ -98,14 +98,14 @@ See [example_few_shot_metadata.csv](example_few_shot_metadata.csv). The CSV row 
 
 The following scripts generate corrupted versions of clean images while retaining their labels:
 
-- [apply_artefacts.py](apply_artefacts.py): Gaussian noise, rotation, random crop, motion, and bias field
-- [apply_new_artefacts.py](apply_new_artefacts.py): impulse noise, brightness change, defocus blur, and zoom blur
-- [apply_resize.py](apply_resize.py): aspect-ratio-preserving resize with Gaussian noise
+- [apply_artefacts.py](preprocessing/apply_artefacts.py): Gaussian noise, rotation, random crop, motion, and bias field
+- [apply_new_artefacts.py](preprocessing/apply_new_artefacts.py): impulse noise, brightness change, defocus blur, and zoom blur
+- [apply_resize.py](preprocessing/apply_resize.py): aspect-ratio-preserving resize with Gaussian noise
 
 Weak and strong settings are defined in the scripts. For example, the classic artefacts can be generated with:
 
 ```bash
-python Codes/reproducible/apply_artefacts.py \
+python -m preprocessing.apply_artefacts \
   --input_csv metadata/clean.csv \
   --output_csv metadata/artefact.csv \
   --output_dir data/generated_artefacts \
@@ -116,7 +116,7 @@ python Codes/reproducible/apply_artefacts.py \
 The additional artefacts can be generated with:
 
 ```bash
-python Codes/reproducible/apply_new_artefacts.py \
+python -m preprocessing.apply_new_artefacts \
   --input_csv metadata/clean.csv \
   --output_csv metadata/new_artefacts.csv \
   --output_dir data/new_artefacts \
@@ -133,7 +133,7 @@ Generated rows should retain the source image's `fileindex` and `binarylabel` so
 
 ### Zero-shot prompting
 
-Zero-shot inference and prompt-template code is provided in [adapter_test.py](adapter_test.py). Prompt templates can be edited in the source code for different zero-shot cue formulations. Precomputed zero-shot results are not included.
+Zero-shot inference and prompt-template code is provided in [vlm_evaluation.py](evaluation/vlm_evaluation.py). Prompt templates can be edited in the source code for different zero-shot cue formulations. Precomputed zero-shot results are not included.
 
 The base task asks the VLM to return one of two labels:
 
@@ -144,7 +144,7 @@ disease
 
 ### Few-shot prompting
 
-Few-shot inference is implemented in [vlm_few_shot.py](vlm_few_shot.py). Labelled images are supplied as in-context demonstrations through a metadata CSV. The selected rows determine which images and labels are used and the order in which they are provided to the model.
+Few-shot inference is implemented in [vlm_few_shot.py](evaluation/vlm_few_shot.py). Labelled images are supplied as in-context demonstrations through a metadata CSV. The selected rows determine which images and labels are used and the order in which they are provided to the model.
 
 ## 7. Parameter-Efficient Adaptation
 
@@ -152,20 +152,20 @@ Three trainable adaptation methods are provided.
 
 ### Vision-language projector tuning
 
-The vision encoder and language model remain frozen while the vision-language projector is updated. See [proj_gen_train.py](proj_gen_train.py).
+The vision encoder and language model remain frozen while the vision-language projector is updated. See [proj_gen_train.py](training/proj_gen_train.py).
 
 ### LoRA tuning
 
-The pretrained VLM remains frozen while low-rank trainable parameters are added to selected language-model attention projections. See [lora_gen_train.py](lora_gen_train.py).
+The pretrained VLM remains frozen while low-rank trainable parameters are added to selected language-model attention projections. See [lora_gen_train.py](training/lora_gen_train.py).
 
 ### Final-representation adapter tuning
 
-The VLM backbone remains frozen while a lightweight adapter and binary classifier are trained on the final model representation. See [adapter_train.py](adapter_train.py).
+The VLM backbone remains frozen while a lightweight adapter and binary classifier are trained on the final model representation. See [adapter_train.py](training/adapter_train.py).
 
 Example adapter training using Qwen3-VL:
 
 ```bash
-python Codes/reproducible/adapter_train.py \
+python -m training.adapter_train \
   --backend qwen3 \
   --clean_csv metadata/clean.csv \
   --artefact_csv metadata/artefact.csv \
@@ -183,7 +183,7 @@ Add `--resume` to continue an interrupted run. Using an exact Hugging Face commi
 Evaluation can be performed on any dataset following the metadata format above.
 
 ```bash
-python Codes/reproducible/adapter_test.py \
+python -m evaluation.vlm_evaluation \
   --run_vlm \
   --backend qwen3 \
   --vlm_ckpt outputs/adapter/qwen3_seed42_best.pt \

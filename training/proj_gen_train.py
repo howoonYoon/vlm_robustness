@@ -976,7 +976,7 @@ def load_model_on_device(
 
 def load_backend(backend: str, model_id: str, args: argparse.Namespace):
     if bool(getattr(args, "use_lora_loader", False)):
-        import lora_gen_train as lgt
+        from training import lora_gen_train as lgt
 
         visible = os.environ.get("CUDA_VISIBLE_DEVICES", "<not set>")
         n_visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
