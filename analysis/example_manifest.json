@@ -1,0 +1,32 @@
+[
+  {
+    "setting": "internal",
+    "family": "adaptation",
+    "model": "Qwen3-VL",
+    "method": "baseline",
+    "path": "../outputs/qwen3_internal_baseline.json"
+  },
+  {
+    "setting": "internal",
+    "family": "adaptation",
+    "model": "Qwen3-VL",
+    "method": "fewshot",
+    "path": "../outputs/qwen3_internal_fewshot.json"
+  },
+  {
+    "setting": "unseen",
+    "family": "adaptation",
+    "model": "Qwen3-VL",
+    "method": "baseline",
+    "path": "../outputs/qwen3_unseen_baseline.json",
+    "clean_reference": "../outputs/qwen3_internal_baseline.json"
+  },
+  {
+    "setting": "unseen",
+    "family": "adaptation",
+    "model": "Qwen3-VL",
+    "method": "fewshot",
+    "path": "../outputs/qwen3_unseen_fewshot.json",
+    "clean_reference": "../outputs/qwen3_internal_fewshot.json"
+  }
+]

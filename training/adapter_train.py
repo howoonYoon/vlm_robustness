@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import os
@@ -1078,6 +1078,8 @@ def main() -> None:
             if "optimizer" in ckpt:
                 optimizer.load_state_dict(ckpt["optimizer"])
             restore_rng_state(ckpt.get("rng_state"))
+            if ckpt.get("selection_metric") != "mean_clean_artefact_f1_thr05":
+                raise ValueError("Use a new save_dir/tag when changing checkpoint selection criterion")
             best_val_score = float(ckpt.get("best_val_score", -1.0))
             start_epoch = int(ckpt.get("epoch", 0))
             epoch_logs = ckpt.get("epoch_logs", [])
@@ -1145,11 +1147,11 @@ def main() -> None:
 
             va_thr_best = va_over_best.get("best_thr", 0.5)
             va_f1_best  = va_over_best.get("best_f1", float("nan"))
-            score = float(va_f1_best)
+            score = 0.5 * (float(va_clean_05["f1"]) + float(va_art_05["f1"]))
 
             if not np.isnan(score) and score > best_val_score:
                 best_val_score = float(score)
-                best_val_thr = float(va_thr_best)
+                best_val_thr = 0.5
 
                 torch_save_atomic(
                     {
@@ -1161,6 +1163,7 @@ def main() -> None:
                         "layer_choice": vlm_adapt.layer_choice,
                         "epoch": epoch + 1,
                         "best_val_score": best_val_score,
+                        "selection_metric": "mean_clean_artefact_f1_thr05",
                         "best_val_thr": best_val_thr,
                         "val_overall_best": va_over_best,
                         "val_clean_best": va_clean_best,
@@ -1190,6 +1193,7 @@ def main() -> None:
                 "epochs": EPOCHS,
                 "logs": epoch_logs,
                 "best_val_score": best_val_score,
+                        "selection_metric": "mean_clean_artefact_f1_thr05",
                 "best_val_thr": float(best_val_thr),
                 "reproducibility": repro,
 
@@ -1240,6 +1244,7 @@ def main() -> None:
                     "layer_choice": vlm_adapt.layer_choice,
                     "epoch_logs": epoch_logs,
                     "best_val_score": best_val_score,
+                        "selection_metric": "mean_clean_artefact_f1_thr05",
                     "best_val_thr": float(best_val_thr),
                     "val_overall_best": va_over_best,
                     "val_clean_best": va_clean_best,

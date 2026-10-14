@@ -1,0 +1,647 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import gc
+import json
+import mimetypes
+import os
+import re
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+
+DEFAULT_CLEAN_CSV = None
+DEFAULT_ARTEFACT_CSV = None
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data_root", default=".", help="Root for relative image paths in CSVs")
+    p.add_argument("--model", type=str, default="gemini-3.1-pro-preview",
+                   help="Gemini vision-capable model name")
+    p.add_argument("--query_csv", type=str, default=None,
+                   help="single test csv. If set, --clean_csv/--artefact_csv are not used")
+    p.add_argument("--clean_csv", type=str, default=DEFAULT_CLEAN_CSV,
+                   help="clean csv (severity clean)")
+    p.add_argument("--artefact_csv", type=str, default=DEFAULT_ARTEFACT_CSV,
+                   help="artefact/weak csv (severity weak)")
+    p.add_argument("--out_json", type=str, required=True)
+    p.add_argument("--out_csv", type=str, default=None, help="optional per-image CSV output path")
+    p.add_argument("--max_output_tokens", type=int, default=512)
+    p.add_argument("--thinking_level", type=str, default="low", choices=["low", "high"],
+                   help="Gemini 3 Pro supports low/high; default high is more expensive")
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--parse_mode", type=str, default="strict", choices=["strict", "relaxed"])
+    p.add_argument("--only_modality", type=str, default="mri",
+                   help="optional modality filter, e.g. mri/oct/xray, or all for every modality. Default is mri for quick testing")
+    p.add_argument("--sleep", type=float, default=0.0, help="seconds to sleep between API calls")
+    p.add_argument("--limit", type=int, default=None, help="optional limit for quick smoke tests")
+    return p.parse_args()
+
+
+args = parse_args()
+
+
+PROMPT_BY_DATASET = {
+    "mri": "This is a brain MRI scan.\nQuestion: Does this image show normal anatomy or signs of disease?\n\n",
+    "oct": "This is a retinal OCT scan.\nQuestion: Does this image show normal anatomy or signs of disease?\n\n",
+    "xray": "This is a chest X-ray image.\nQuestion: Does this image show normal anatomy or signs of disease?\n\n",
+    "fundus": "This is a retinal fundus photograph.\nQuestion: Does this image show normal anatomy or signs of disease?\n\n",
+}
+
+SYSTEM_PROMPT_SHORT = 'Answer with ONE WORD only: "normal" or "disease". Do not explain.'
+
+
+def _stable_fileindex_from_path(p: str) -> str:
+    b = os.path.basename(str(p).replace("\\", "/"))
+    stem, _ = os.path.splitext(b)
+    return stem
+
+
+def normalize_filepath(path: str) -> str:
+    raw = os.path.expanduser(str(path)).replace("\\", "/")
+    if os.path.isabs(raw):
+        return raw
+    return os.path.join(args.data_root, raw)
+
+
+
+def load_csv(path: str, split: Optional[str] = None) -> pd.DataFrame:
+    df = pd.read_csv(path)
+
+    if "binarylab" in df.columns and "binarylabel" not in df.columns:
+        df = df.rename(columns={"binarylab": "binarylabel"})
+
+    if split is not None:
+        split_norm = str(split).strip().lower()
+        if "use_type" not in df.columns:
+            raise RuntimeError(f"'use_type' column missing in {path} (required for split={split_norm})")
+        df = df[df["use_type"].astype(str).str.lower() == split_norm].copy()
+
+    if "severity" not in df.columns:
+        df["severity"] = "clean"
+
+    if "filepath" not in df.columns:
+        raise RuntimeError(f"'filepath' column missing in {path}")
+
+    df["filepath"] = df["filepath"].astype(str).map(normalize_filepath)
+
+    if "fileindex" not in df.columns:
+        df["fileindex"] = df["filepath"].map(_stable_fileindex_from_path)
+
+    if "dataset" not in df.columns:
+        raise RuntimeError(f"'dataset' column missing in {path}")
+
+    df["severity_norm"] = df["severity"].fillna("clean").astype(str).str.lower()
+    df["dataset_norm"] = df["dataset"].astype(str).str.lower()
+    return df.reset_index(drop=True)
+
+
+def filter_modality(df: pd.DataFrame, modality: Optional[str], name: str) -> pd.DataFrame:
+    if modality is None or str(modality).strip() == "":
+        return df.reset_index(drop=True)
+
+    mod = str(modality).strip().lower()
+    if mod in ("all", "none", "*"):
+        return df.reset_index(drop=True)
+
+    out = df[df["dataset_norm"].astype(str).str.lower() == mod].copy().reset_index(drop=True)
+    if len(out) == 0:
+        raise RuntimeError(f"No rows left in {name} after --only_modality {mod}")
+    print(f"[filter] {name}: modality={mod}, rows={len(out)}", flush=True)
+    return out
+
+
+def count_valid_pairs(df_pair: pd.DataFrame) -> int:
+    n = 0
+    for _, g in df_pair.groupby("fileindex"):
+        sev = g["severity_norm"].astype(str).str.lower()
+        n_clean = int((sev == "clean").sum())
+        n_weak = int((sev == "weak").sum())
+        if n_clean >= 1 and n_weak == 5:
+            n += 1
+    return int(n)
+
+
+def _guess_mime(path: str) -> str:
+    mime, _ = mimetypes.guess_type(path)
+    return mime or "image/png"
+
+
+def _gemini_image_part(path: str):
+    from google.genai import types
+
+    with open(path, "rb") as f:
+        data = f.read()
+    return types.Part.from_bytes(data=data, mime_type=_guess_mime(path))
+
+
+def build_gemini_contents(
+    query_image_path: str,
+    query_text: str,
+) -> List[Any]:
+    from google.genai import types
+
+    return [
+        types.Content(
+            role="user",
+            parts=[_gemini_image_part(query_image_path), types.Part.from_text(text=query_text)],
+        )
+    ]
+
+
+def _parse_normal_disease(text: str) -> Optional[int]:
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+
+    m_json = re.search(r'\{\s*"label"\s*:\s*"(normal|disease)"\s*\}', t, flags=re.IGNORECASE)
+    if m_json:
+        return 0 if m_json.group(1).lower() == "normal" else 1
+
+    m_json_partial = re.search(r'"label"\s*:\s*"(normal|disease)\b', t, flags=re.IGNORECASE)
+    if m_json_partial:
+        return 0 if m_json_partial.group(1).lower() == "normal" else 1
+
+    ans = t
+    for marker in ["answer:", "assistant:"]:
+        if marker in ans:
+            ans = ans.split(marker)[-1].strip()
+
+    lines = [ln.strip() for ln in ans.splitlines() if ln.strip()]
+    answer_lines = []
+    for ln in lines:
+        if ln.startswith("explanation:"):
+            break
+        answer_lines.append(ln)
+    if not answer_lines:
+        answer_lines = lines if lines else [ans]
+
+    block = " ".join(answer_lines).strip()
+    if not block:
+        return None
+
+    has_normal_block = re.search(r"\bnormal\b", block) is not None
+    has_disease_block = re.search(r"\bdisease\b", block) is not None
+    if has_normal_block and has_disease_block:
+        return None
+
+    for ln in answer_lines:
+        m_exact = re.fullmatch(r'["\']?\s*(normal|disease)\s*["\']?[.!?]?\s*', ln)
+        if m_exact:
+            return 0 if m_exact.group(1) == "normal" else 1
+        if re.search(r"\bnormal\b", ln) is not None:
+            return 0
+        if re.search(r"\bdisease\b", ln) is not None:
+            return 1
+
+    if has_normal_block:
+        return 0
+    if has_disease_block:
+        return 1
+    return None
+
+
+def infer_one_gemini(client, model: str, image_path: str, text: str) -> Tuple[str, Optional[int], Dict[str, Any]]:
+    from google.genai import types
+
+    response = client.models.generate_content(
+        model=model,
+        contents=build_gemini_contents(
+            query_image_path=image_path,
+            query_text=text,
+        ),
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT_SHORT,
+            max_output_tokens=int(args.max_output_tokens),
+            temperature=float(args.temperature),
+            thinking_config=types.ThinkingConfig(thinking_level=args.thinking_level),
+        ),
+    )
+
+    raw = (getattr(response, "text", None) or "").strip()
+    if not raw and hasattr(response, "model_dump"):
+        raw = _extract_text_from_gemini_dump(response.model_dump()).strip()
+
+    pred_label = _parse_normal_disease(raw)
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        usage = getattr(response, "usage_metadata", None)
+    if hasattr(usage, "model_dump"):
+        usage = usage.model_dump()
+    return raw, (None if pred_label is None else int(pred_label)), {
+        "usage": usage,
+        "finish_reason": _extract_gemini_finish_reason(response),
+        "prompt_feedback": _model_dump_or_none(getattr(response, "prompt_feedback", None)),
+    }
+
+
+def _model_dump_or_none(x: Any) -> Optional[Dict[str, Any]]:
+    if x is None:
+        return None
+    if hasattr(x, "model_dump"):
+        return x.model_dump()
+    if isinstance(x, dict):
+        return x
+    return {"value": str(x)}
+
+
+def _extract_text_from_gemini_dump(dumped: Dict[str, Any]) -> str:
+    texts: List[str] = []
+    for cand in dumped.get("candidates", []) or []:
+        content = cand.get("content") or {}
+        for part in content.get("parts", []) or []:
+            if isinstance(part, dict):
+                txt = part.get("text")
+                if txt:
+                    texts.append(str(txt))
+    return "\n".join(texts)
+
+
+def _extract_gemini_finish_reason(response: Any) -> Optional[str]:
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        return None
+    reason = getattr(candidates[0], "finish_reason", None)
+    return None if reason is None else str(reason)
+
+
+def _to_nullable_float(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    try:
+        v = float(x)
+    except Exception:
+        return None
+    if not np.isfinite(v):
+        return None
+    return v
+
+
+def _compute_balanced_accuracy_and_f1_from_optional_preds(
+    y_true_list: List[int],
+    y_pred_list: List[Optional[int]],
+) -> Dict[str, Optional[float]]:
+    valid = [(int(y), int(p)) for y, p in zip(y_true_list, y_pred_list) if p in (0, 1)]
+    if len(valid) == 0:
+        return {
+            "balanced_accuracy": None,
+            "f1_score": None,
+            "accuracy": None,
+            "sensitivity": None,
+            "specificity": None,
+            "tp": None,
+            "tn": None,
+            "fp": None,
+            "fn": None,
+        }
+
+    tp = sum(1 for y, p in valid if y == 1 and p == 1)
+    tn = sum(1 for y, p in valid if y == 0 and p == 0)
+    fp = sum(1 for y, p in valid if y == 0 and p == 1)
+    fn = sum(1 for y, p in valid if y == 1 and p == 0)
+    eps = 1e-12
+    acc = (tp + tn) / (tp + tn + fp + fn + eps)
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    f1 = 2 * precision * recall / (precision + recall + eps)
+    sensitivity = recall
+    specificity = tn / (tn + fp + eps)
+    bacc = 0.5 * (sensitivity + specificity)
+
+    return {
+        "balanced_accuracy": _to_nullable_float(bacc),
+        "f1_score": _to_nullable_float(f1),
+        "accuracy": _to_nullable_float(acc),
+        "sensitivity": _to_nullable_float(sensitivity),
+        "specificity": _to_nullable_float(specificity),
+        "tp": int(tp),
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+    }
+
+
+def _mean_optional(vals: List[Optional[float]]) -> Optional[float]:
+    valid = [float(v) for v in vals if v is not None and np.isfinite(v)]
+    if len(valid) == 0:
+        return None
+    return float(sum(valid) / len(valid))
+
+
+def compute_metrics_from_records(records: List[Dict[str, Any]], pred_key: str = "pred_label") -> Dict[str, Any]:
+    clean_recs = [r for r in records if str(r.get("severity", "")).lower() == "clean"]
+    art_recs = [r for r in records if str(r.get("severity", "")).lower() == "weak"]
+
+    y_clean = [int(r["y_true"]) for r in clean_recs if r.get("y_true") is not None]
+    y_art = [int(r["y_true"]) for r in art_recs if r.get("y_true") is not None]
+    pred_clean = [r.get(pred_key) for r in clean_recs if r.get("y_true") is not None]
+    pred_art = [r.get(pred_key) for r in art_recs if r.get("y_true") is not None]
+    clean_lbl = _compute_balanced_accuracy_and_f1_from_optional_preds(y_clean, pred_clean)
+    art_lbl = _compute_balanced_accuracy_and_f1_from_optional_preds(y_art, pred_art)
+    clean_bacc = clean_lbl["balanced_accuracy"]
+    art_bacc = art_lbl["balanced_accuracy"]
+    performance_gap = None if (clean_bacc is None or art_bacc is None) else _to_nullable_float(clean_bacc - art_bacc)
+
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for r in records:
+        fid = str(r.get("fileindex"))
+        if fid not in grouped:
+            grouped[fid] = {"clean": None, "weak": []}
+        sev = str(r.get("severity", "")).lower()
+        if sev == "clean" and grouped[fid]["clean"] is None:
+            grouped[fid]["clean"] = r
+        elif sev == "weak":
+            grouped[fid]["weak"].append(r)
+
+    consistency_vals: List[float] = []
+    rel_num = 0
+    rel_den = 0
+    cwc_num = 0
+    cwc_den = 0
+    for _, g in grouped.items():
+        c = g["clean"]
+        ws = g["weak"]
+        if c is None or len(ws) == 0:
+            continue
+
+        weak_preds = [w.get(pred_key) for w in ws]
+        weak_valid = [int(p) for p in weak_preds if p in (0, 1)]
+        if len(weak_valid) == len(ws):
+            n0 = sum(1 for p in weak_valid if p == 0)
+            n1 = len(weak_valid) - n0
+            consistency_vals.append(float(max(n0, n1) / max(1, len(weak_valid))))
+            n_pos = sum(1 for p in weak_valid if p == 1)
+            maj_pred = 1 if n_pos >= (len(weak_valid) / 2) else 0
+        else:
+            maj_pred = None
+
+        c_pred = c.get(pred_key)
+        y = c.get("y_true")
+        if c_pred in (0, 1) and maj_pred in (0, 1):
+            cwc_den += 1
+            if int(maj_pred) == int(c_pred):
+                cwc_num += 1
+
+        if y in (0, 1) and c_pred in (0, 1) and int(c_pred) == int(y) and maj_pred in (0, 1):
+            rel_den += 1
+            if int(maj_pred) != int(y):
+                rel_num += 1
+
+    prediction_consistency = _mean_optional([_to_nullable_float(v) for v in consistency_vals])
+    flip_rate = None if rel_den == 0 else _to_nullable_float(rel_num / rel_den)
+    consistency_with_clean = None if cwc_den == 0 else _to_nullable_float(cwc_num / cwc_den)
+
+    return {
+        "label_based_metrics": {
+            "clean": clean_lbl,
+            "artefact": {
+                "balanced_accuracy": art_lbl["balanced_accuracy"],
+                "f1_score": art_lbl["f1_score"],
+                "accuracy": art_lbl["accuracy"],
+                "sensitivity": art_lbl["sensitivity"],
+                "specificity": art_lbl["specificity"],
+                "tp": art_lbl["tp"],
+                "tn": art_lbl["tn"],
+                "fp": art_lbl["fp"],
+                "fn": art_lbl["fn"],
+                "performance_gap": performance_gap,
+            },
+            "robustness": {
+                "prediction_consistency": prediction_consistency,
+                "consistency_with_clean": consistency_with_clean,
+            },
+            "reliability": {
+                "flip_rate": flip_rate,
+            },
+        }
+    }
+
+
+def compute_metrics_by_modality(records: List[Dict[str, Any]], pred_key: str = "pred_label") -> Dict[str, Dict[str, Any]]:
+    mods = sorted({
+        str(r.get("modality", "")).lower()
+        for r in records
+        if str(r.get("modality", "")).strip() != ""
+    })
+    out: Dict[str, Dict[str, Any]] = {}
+    for m in mods:
+        sub = [r for r in records if str(r.get("modality", "")).lower() == m]
+        out[m] = compute_metrics_from_records(sub, pred_key=pred_key)
+    return out
+
+
+def _is_missing_value(x: Any) -> bool:
+    try:
+        return bool(pd.isna(x))
+    except Exception:
+        return False
+
+
+def _clean_loaded_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in record.items():
+        out[k] = None if _is_missing_value(v) else v
+
+    for k in ["idx", "y_true", "pred_label"]:
+        if out.get(k) is not None:
+            out[k] = int(out[k])
+    return out
+
+
+def _append_record_csv(out_csv: str, record: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
+    write_header = not os.path.exists(out_csv) or os.path.getsize(out_csv) == 0
+    pd.DataFrame([record]).to_csv(
+        out_csv,
+        mode="a",
+        header=write_header,
+        index=False,
+        encoding="utf-8",
+    )
+
+
+def _load_existing_records(out_csv: str, target_paths: set) -> List[Dict[str, Any]]:
+    if not out_csv or not os.path.exists(out_csv) or os.path.getsize(out_csv) == 0:
+        return []
+
+    df_prev = pd.read_csv(out_csv, on_bad_lines="skip")
+    if "path" not in df_prev.columns:
+        return []
+
+    df_prev = df_prev[df_prev["path"].astype(str).isin(target_paths)].copy()
+    by_path: Dict[str, Dict[str, Any]] = {}
+    for record in df_prev.to_dict("records"):
+        clean_record = _clean_loaded_record(record)
+        path = clean_record.get("path")
+        if path is not None:
+            by_path[str(path)] = clean_record
+    return list(by_path.values())
+
+
+def run_query_df(client, dfq: pd.DataFrame, split_name: str, out_csv: str):
+    outputs = []
+
+    if args.limit is not None:
+        dfq = dfq.head(int(args.limit)).copy()
+
+    target_paths = set(dfq["filepath"].astype(str).tolist())
+    existing_outputs = _load_existing_records(out_csv, target_paths)
+    completed_paths = {str(r["path"]) for r in existing_outputs if r.get("path") is not None}
+    outputs.extend(existing_outputs)
+    if completed_paths:
+        print(f"[resume] loaded {len(completed_paths)} existing rows from {out_csv}", flush=True)
+
+    for i, row in dfq.iterrows():
+        mod = str(row["dataset_norm"]).lower()
+        image_path = str(row["filepath"])
+        if image_path in completed_paths:
+            continue
+
+        print(
+            f"[sample] {len(outputs)+1}/{len(dfq)} | fileindex={row['fileindex']} | modality={mod}",
+            flush=True,
+        )
+
+        y_true = None if ("binarylabel" not in row or pd.isna(row["binarylabel"])) else int(row["binarylabel"])
+        prompt = PROMPT_BY_DATASET.get(mod, PROMPT_BY_DATASET["mri"])
+
+        raw, y_pred, meta = infer_one_gemini(
+            client=client,
+            model=args.model,
+            image_path=image_path,
+            text=prompt,
+        )
+
+        outputs.append({
+            "split": split_name,
+            "idx": int(i),
+            "fileindex": str(row["fileindex"]),
+            "path": image_path,
+            "modality": mod,
+            "severity": str(row.get("severity_norm", "clean")),
+            "y_true": None if y_true is None else int(y_true),
+            "pred_label": (int(y_pred) if y_pred in (0, 1) else None),
+            "raw_text": raw,
+            "finish_reason": meta.get("finish_reason"),
+            "prompt_feedback": json.dumps(meta.get("prompt_feedback"), ensure_ascii=False),
+            "usage": json.dumps(meta.get("usage"), ensure_ascii=False),
+        })
+        _append_record_csv(out_csv, outputs[-1])
+        completed_paths.add(image_path)
+        print(f"[append] {out_csv}", flush=True)
+
+        if args.sleep > 0:
+            time.sleep(float(args.sleep))
+
+    metrics = compute_metrics_from_records(outputs, pred_key="pred_label")
+    metrics_by_modality = compute_metrics_by_modality(outputs, pred_key="pred_label")
+
+    return {
+        "split": split_name,
+        "n_total": int(len(dfq)),
+        "label_based_metrics": metrics["label_based_metrics"],
+        "metrics_by_modality": metrics_by_modality,
+        "per_image": outputs,
+    }
+
+
+def main():
+    if not os.environ.get("GEMINI_API_KEY"):
+        raise RuntimeError("GEMINI_API_KEY is not set")
+
+    from google import genai
+
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+    if args.query_csv:
+        df_pair = load_csv(args.query_csv, split="test")
+        df_pair = filter_modality(df_pair, args.only_modality, "query_csv")
+        n_clean = int((df_pair["severity_norm"].astype(str).str.lower() == "clean").sum())
+        n_weak = int((df_pair["severity_norm"].astype(str).str.lower() == "weak").sum())
+        clean_csv = None
+        artefact_csv = None
+        query_csv = args.query_csv
+    else:
+        df_clean = load_csv(args.clean_csv, split="test")
+        df_weak = load_csv(args.artefact_csv, split="test")
+
+        df_clean["severity_norm"] = "clean"
+        df_weak["severity_norm"] = "weak"
+
+        df_clean = filter_modality(df_clean, args.only_modality, "clean_csv")
+        df_weak = filter_modality(df_weak, args.only_modality, "artefact_csv")
+
+        df_pair = pd.concat([df_clean, df_weak], ignore_index=True)
+        n_clean = int(len(df_clean))
+        n_weak = int(len(df_weak))
+        clean_csv = args.clean_csv
+        artefact_csv = args.artefact_csv
+        query_csv = None
+
+    out_csv = args.out_csv
+    if not out_csv:
+        root, _ = os.path.splitext(args.out_json)
+        out_csv = root + ".csv"
+
+    res_pair_all = run_query_df(client, df_pair, "pair_set_test", out_csv)
+    n_pairs = count_valid_pairs(df_pair)
+
+    model_key = f"gemini_zero_shot:{args.model}"
+    model_result = {
+        "model_type": "gemini_zero_shot",
+        "id": f"{args.model}:zero_shot",
+        "ckpt": None,
+        "config": {
+            "model": args.model,
+            "layer": "zero_shot",
+            "adapter_on_clean": None,
+            "eff_variant": None,
+            "eff_img_size": None,
+            "hidden": None,
+            "freeze_backbone": None,
+            "max_output_tokens": int(args.max_output_tokens),
+            "thinking_level": args.thinking_level,
+            "temperature": float(args.temperature),
+            "parse_mode": args.parse_mode,
+            "only_modality": args.only_modality,
+        },
+        "label_based_metrics": res_pair_all["label_based_metrics"],
+        "metrics_by_modality": res_pair_all["metrics_by_modality"],
+        "per_image": res_pair_all["per_image"],
+    }
+
+    results = {
+        "schema_version": "1.0",
+        "thr": 0.5,
+        "data": {
+            "query_csv": query_csv,
+            "clean_csv": clean_csv,
+            "artefact_csv": artefact_csv,
+            "n_clean": int(n_clean),
+            "n_art": int(n_weak),
+            "n_total": int(len(df_pair)),
+            "n_pairs": int(n_pairs),
+            "only_modality": args.only_modality,
+        },
+        "models": {
+            model_key: model_result,
+        },
+    }
+
+    os.makedirs(os.path.dirname(args.out_json) or ".", exist_ok=True)
+    with open(args.out_json, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    print(f"[saved] {args.out_json}", flush=True)
+
+    print(f"[saved] {out_csv}", flush=True)
+
+    gc.collect()
+
+
+if __name__ == "__main__":
+    main()

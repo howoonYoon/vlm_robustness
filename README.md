@@ -209,3 +209,39 @@ AIER = harmful artefact errors / eligible artefact views
 ```
 
 Lower AIER indicates greater conditional prediction stability. Results are saved to the path specified by `--out_json`. Use `--overwrite` only when intentionally replacing an existing result file.
+
+## 9. Statistical analysis
+
+[analysis/bootstrap_metrics.py](analysis/bootstrap_metrics.py) calculates disease-class F1, AIER, source-image cluster bootstrap confidence intervals, paired comparisons, and Holm correction from saved per-image predictions. See the [analysis instructions](analysis/README.md) for input schemas and comparison families.
+
+```bash
+python -m analysis.bootstrap_metrics --manifest analysis/example_manifest.json \
+  --output outputs/bootstrap_metrics.csv --n_boot 2000 --seed 42
+```
+
+The manifest is a template. Replace its paths and include all methods/models in each comparison family. Use the final study cohort consistently across baseline and adapted predictions.
+
+## 10. Proprietary models and model coverage
+
+Install the additional API dependencies with `python -m pip install -r requirements-commercial.txt`. The four `evaluation/{openai,gemini}_{zero,few}_shot_test.py` scripts provide baseline and few-shot inference for proprietary models. Set `OPENAI_API_KEY` or `GEMINI_API_KEY` in the environment.
+
+```bash
+python -m evaluation.openai_zero_shot_test \
+  --query_csv metadata/test.csv --data_root data/ \
+  --only_modality oct --out_json outputs/openai_oct_base.json
+python -m evaluation.openai_few_shot_test \
+  --demo_csv metadata/demos.csv --query_csv metadata/test.csv --data_root data/ \
+  --only_modality oct --out_json outputs/openai_oct_fewshot.json
+```
+
+Use `evaluation.gemini_zero_shot_test` or `evaluation.gemini_few_shot_test` for Gemini. API runs send images to the configured provider and incur API charges. Record the actual model identifier and run options used for the reported experiment.
+
+For adapter training covering all six manuscript models, use `python -m training.adapter_train_new` with `--backend qwen3`, `qwen35`, `internvl`, `medgemma`, `lingshu`, or `lingshu_i`. Run `--help` for each script's arguments. The original adapter trainer remains available.
+
+## 11. Checkpoint selection and release scope
+
+Projector and LoRA training select the best epoch using the arithmetic mean of clean validation F1 and pooled artefact validation F1. Both adapter trainers use the same mean at classification threshold 0.5. The selection criterion is saved with checkpoints; resuming a checkpoint with an older or unknown criterion is rejected. Use a new output directory/tag for new runs.
+
+This changes selection for future runs; it does not reselect or retrain historical study checkpoints. Verify the reported experiments against the archived run logs. See [release notes](docs/RELEASE_NOTES.md).
+
+This release includes preprocessing, artefact generation, inference, adaptation, and statistical analysis code. Publication figure-generation code is not included. The example metadata files demonstrate schemas; they are not the final study splits or the actual few-shot demonstrations. Exact final splits, demonstration IDs/order, model revisions, and archived predictions must be supplied separately for full study reproduction. In the manuscript, describe only the materials actually available, and identify how reviewers can access any additional materials.

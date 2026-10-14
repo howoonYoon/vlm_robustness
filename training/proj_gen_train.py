@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
@@ -39,6 +39,9 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 
+from training.checkpoint_selection import (
+    SELECTION_METRIC, validation_f1, validate_selection_resume,
+)
 from repro_utils import (
     add_reproducibility_args,
     build_repro_metadata,
@@ -2457,6 +2460,7 @@ def main() -> None:
 
     if args.resume:
         ckpt = resume_ckpt
+        validate_selection_resume(ckpt)
         if isinstance(ckpt.get("projector"), dict):
             projector.load_state_dict(ckpt["projector"], strict=True)
         if isinstance(ckpt.get("optimizer"), dict):
@@ -2495,7 +2499,7 @@ def main() -> None:
         val_overall = val_m.get("overall", {})
         val_clean = val_m.get("clean", {})
         val_weak = val_m.get("weak", {})
-        val_f1 = float(val_overall.get("f1", float("nan")))
+        val_f1 = validation_f1(val_m)
         val_acc = float(val_overall.get("acc", float("nan")))
         invalid_rate = float(val_overall.get("invalid_rate", float("nan")))
 
@@ -2503,7 +2507,7 @@ def main() -> None:
             f"[{args.backend}] Epoch {epoch + 1}/{args.epochs}\n"
             f"Train: loss={train_m['loss']:.4f} n={train_m['n_examples']}\n"
             f"Val  : loss={val_m['loss']:.4f} "
-            f"GenF1={val_f1:.3f} Acc={val_acc:.3f} Invalid={invalid_rate:.3f} "
+            f"MeanCleanArtefactF1={val_f1:.3f} Acc={val_acc:.3f} Invalid={invalid_rate:.3f} "
             f"CleanF1={float(val_clean.get('f1', float('nan'))):.3f} "
             f"WeakF1={float(val_weak.get('f1', float('nan'))):.3f}"
         )
@@ -2520,13 +2524,14 @@ def main() -> None:
                     "model_id": model_id,
                     "projector_path": projector_path,
                     "best_val_f1": best_val_f1,
+                    "selection_metric": SELECTION_METRIC,
                     "config": vars(args),
                     "reproducibility": repro,
                     "rng_state": capture_rng_state(generator),
                 },
                 best_ckpt,
             )
-            print(f"BEST saved: {best_ckpt} (GenF1={best_val_f1:.4f})")
+            print(f"BEST saved: {best_ckpt} (MeanCleanArtefactF1={best_val_f1:.4f})")
 
         payload = {
             "run_id": run_id,
@@ -2535,6 +2540,7 @@ def main() -> None:
             "projector_path": projector_path,
             "tag": args.tag,
             "best_val_f1": best_val_f1,
+            "selection_metric": SELECTION_METRIC,
             "logs": epoch_logs,
             "config": vars(args),
             "reproducibility": repro,
@@ -2551,6 +2557,7 @@ def main() -> None:
                 "model_id": model_id,
                 "projector_path": projector_path,
                 "best_val_f1": best_val_f1,
+                "selection_metric": SELECTION_METRIC,
                 "epoch_logs": epoch_logs,
                 "config": vars(args),
                 "reproducibility": repro,
